@@ -8,7 +8,7 @@
  *   models/kokoro/…                  — Kokoro-82M weights + voices
  */
 import { execFileSync } from "node:child_process";
-import { copyFileSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { arch, homedir, platform } from "node:os";
 import * as path from "node:path";
 import { Readable } from "node:stream";
@@ -48,11 +48,25 @@ export function hasEspeak(): boolean {
 	}
 }
 
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 /** Downloads to a file of its own and renames it into place, so sessions provisioning at once can't corrupt it. */
 async function download(url: string, dest: string): Promise<void> {
 	const res = await fetch(url);
 	if (!res.ok || !res.body) throw new Error(`${res.status} ${res.statusText} for ${url}`);
 	mkdirSync(path.dirname(dest), { recursive: true });
+	// Pi quit during an earlier download: drop what it left behind
+	for (const file of readdirSync(path.dirname(dest))) {
+		const pid = file.startsWith(`${path.basename(dest)}.`) && file.match(/\.(\d+)\.tmp$/)?.[1];
+		if (pid && !alive(Number(pid))) rmSync(path.join(path.dirname(dest), file), { force: true });
+	}
 	const tmp = `${dest}.${process.pid}.tmp`;
 	try {
 		await pipeline(Readable.fromWeb(res.body as never), createWriteStream(tmp));
