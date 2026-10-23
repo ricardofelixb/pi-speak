@@ -14,6 +14,12 @@ import { spawn, ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
+import { hasEspeak, ortLibPath, provision, ROOT } from "./provision";
+
+// A machine with this file speaks through another machine's daemon, which an SSH tunnel serves on REMOTE_SOCKET
+// (the desktop creates both). It never runs a daemon of its own, so it never downloads one either.
+const REMOTE_MARKER = path.join(ROOT, "remote");
+const REMOTE_SOCKET = path.join(ROOT, "remote.sock");
 
 interface SpeakIPCRequest {
 	action: "feed" | "flush" | "say" | "stop" | "stop_all" | "status" | "shutdown" | "set_voice" | "set_speed";
@@ -106,6 +112,45 @@ let clientSocket: net.Socket | null = null;
 let connectingPromise: Promise<net.Socket> | null = null;
 let daemonProcess: ChildProcess | null = null;
 let sessionContext: ExtensionContext | null = null;
+// No daemon to reach: messages are dropped until retryAt rather than each one trying again.
+let retryAt = 0;
+let provisioning: Promise<string> | null = null;
+let provisioned: string | null = null;
+let setupError: string | null = null;
+
+function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
+	if (sessionContext?.hasUI) sessionContext.ui.notify(`pi-speak: ${message}`, level);
+}
+
+/** The daemon binary once this machine has everything it needs, downloading the rest in the background. */
+function readyBinary(): string | null {
+	if (setupError) return null;
+	if (!hasEspeak()) {
+		setupError = "needs espeak-ng: sudo pacman -S espeak-ng (Arch), sudo apt install espeak-ng, or brew install espeak-ng";
+		notify(setupError, "warning");
+		return null;
+	}
+	if (process.env.PI_SPEAK_BIN) return resolveBinaryPath();
+	if (!provisioning) {
+		let announced = false;
+		provisioning = provision((step) => {
+			if (!announced) notify("first run: downloading the voice (about 350 MB), speech starts once it's done");
+			announced = true;
+			console.error(`pi-speak: ${step}`);
+		});
+		provisioning.then(
+			(bin) => {
+				provisioned = bin;
+				if (announced) notify("voice ready");
+			},
+			(error: unknown) => {
+				setupError = `setup failed: ${getErrorMessage(error)}`;
+				notify(setupError, "error");
+			}
+		);
+	}
+	return provisioned;
+}
 
 /**
  * Extracts a readable error message from an unknown catch clause value.
@@ -127,6 +172,7 @@ function getSocketPath(): string {
 	if (process.env.PI_SPEAK_SOCKET) {
 		return process.env.PI_SPEAK_SOCKET;
 	}
+	if (fs.existsSync(REMOTE_MARKER)) return REMOTE_SOCKET;
 
 	const tmpSock = "/tmp/pi-speak.sock";
 	const xdgRuntime = process.env.XDG_RUNTIME_DIR;
@@ -202,8 +248,13 @@ async function getSocket(): Promise<net.Socket> {
 		return connectingPromise;
 	}
 
+	if (Date.now() < retryAt) {
+		throw new Error("pi-speak daemon unavailable");
+	}
+
 	connectingPromise = (async (): Promise<net.Socket> => {
 		const sockPath = getSocketPath();
+		const remote = sockPath === REMOTE_SOCKET;
 
 		// 1. Try connecting to existing socket
 		if (fs.existsSync(sockPath)) {
@@ -212,9 +263,10 @@ async function getSocket(): Promise<net.Socket> {
 				setupSocket(sock);
 				return sock;
 			} catch (err: unknown) {
-				// Only unlink if connection was definitively refused (no listening daemon)
+				// Only unlink if connection was definitively refused (no listening daemon). A tunnel's socket belongs
+				// to its SSH server, which replaces it when the desktop reconnects.
 				const nodeErr = err as NodeJS.ErrnoException;
-				if (nodeErr?.code === "ECONNREFUSED") {
+				if (!remote && nodeErr?.code === "ECONNREFUSED") {
 					try {
 						fs.unlinkSync(sockPath);
 					} catch {}
@@ -222,17 +274,18 @@ async function getSocket(): Promise<net.Socket> {
 			}
 		}
 
-		// 2. Spawn daemon if not running
-		const binaryPath = resolveBinaryPath();
+		// 2. Spawn daemon if not running; a machine speaking through a desktop stays silent until the tunnel is back
+		const binaryPath = remote ? null : readyBinary();
 		if (!binaryPath) {
-			throw new Error(
-				"pi-speak binary not found. Build it with 'cargo build --release', install to ~/.cargo/bin, or set PI_SPEAK_BIN."
-			);
+			retryAt = Date.now() + 5000;
+			throw new Error(remote ? "desktop tunnel is down" : setupError ?? "pi-speak is still being set up");
 		}
 
+		const ortLib = ortLibPath();
 		daemonProcess = spawn(binaryPath, ["daemon"], {
 			detached: true,
 			stdio: "ignore",
+			env: { ...process.env, ...(ortLib && !process.env.ORT_DYLIB_PATH ? { ORT_DYLIB_PATH: ortLib } : {}) },
 		});
 		daemonProcess.unref();
 
@@ -252,6 +305,7 @@ async function getSocket(): Promise<net.Socket> {
 			}
 		}
 
+		retryAt = Date.now() + 5000;
 		throw new Error("Failed to connect to pi-speak daemon after spawning");
 	})();
 
@@ -322,7 +376,7 @@ function queryStatus(): Promise<SpeakIPCResponse> {
  */
 function updateStatus(ctx?: ExtensionContext | ExtensionCommandContext): void {
 	const targetCtx = ctx ?? sessionContext;
-	if (!targetCtx?.hasUi || !targetCtx?.ui) return;
+	if (!targetCtx?.hasUI || !targetCtx?.ui) return;
 
 	if (isSpeakingEnabled) {
 		targetCtx.ui.setStatus("speak", "🔊 [TTS: On]");
@@ -437,6 +491,9 @@ export default function (pi: ExtensionAPI): void {
 				case "on":
 				case "unmute": {
 					isSpeakingEnabled = true;
+					// Try again now, e.g. after installing espeak-ng
+					setupError = null;
+					retryAt = 0;
 					updateStatus(ctx);
 					ctx.ui?.notify("Speech output enabled (hands-free automatic).", "info");
 					break;

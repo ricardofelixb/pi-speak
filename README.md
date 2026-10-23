@@ -40,10 +40,22 @@ pi streams tokens ──► speak.ts extension ──► Unix socket ──► p
 pi install npm:@benjaminjamesxyz/pi-speak
 ```
 
-That's it. The package's postinstall step downloads the daemon binary, ONNX Runtime, and models
-(~380 MB total) into `~/.local/share/pi-speak/`, then the extension registers itself. Restart Pi
-and speech just works. Set `PI_SPEAK_SKIP_SETUP=1` before installing if you want to provision
-the native side yourself.
+That's it. The first time a session needs the daemon, the extension downloads it, ONNX Runtime and the
+models (~380 MB total) into `~/.local/share/pi-speak/` in the background, and speech starts once they're
+there. Installing runs no npm scripts. Set `PI_SPEAK_BIN` to use a daemon you built yourself.
+
+### Speaking through another machine
+
+A machine you reach over SSH can speak through the one you sit at. On the remote machine, create
+`~/.local/share/pi-speak/remote`. Its sessions then send speech to `~/.local/share/pi-speak/remote.sock`
+instead of running a daemon, and never download one. On your machine, forward that socket to your daemon's:
+
+```bash
+ssh <remote> rm -f .local/share/pi-speak/remote.sock
+ssh -N -o ExitOnForwardFailure=yes -R .local/share/pi-speak/remote.sock:$XDG_RUNTIME_DIR/pi-speak.sock <remote>
+```
+
+While the tunnel is down, the remote machine's sessions stay silent.
 
 ### Shell one-liner (no npm)
 
