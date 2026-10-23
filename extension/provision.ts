@@ -76,6 +76,19 @@ async function download(url: string, dest: string): Promise<void> {
 	}
 }
 
+const modelPath = (name: string) => path.join(ROOT, "models", "kokoro", name);
+const hasModel = (name: string, minBytes: number) =>
+	existsSync(modelPath(name)) && statSync(modelPath(name)).size >= minBytes * 0.9;
+
+/** The daemon binary when everything it needs is already here. */
+export function installed(): string | null {
+	const t = target();
+	const bin = path.join(ROOT, "bin", "pi-speak");
+	const ready =
+		t && existsSync(bin) && existsSync(path.join(ROOT, "lib", t.ortLib)) && MODELS.every(([n, b]) => hasModel(n, b));
+	return ready ? bin : null;
+}
+
 /** Returns the daemon binary, downloading whatever is missing first. `log` hears about each download. */
 export async function provision(log: (message: string) => void): Promise<string> {
 	const t = target();
@@ -102,10 +115,9 @@ export async function provision(log: (message: string) => void): Promise<string>
 	}
 
 	for (const [name, minBytes] of MODELS) {
-		const dest = path.join(ROOT, "models", "kokoro", name);
-		if (existsSync(dest) && statSync(dest).size >= minBytes * 0.9) continue;
+		if (hasModel(name, minBytes)) continue;
 		log(`downloading ${name} (~${Math.round(minBytes / 1e6)} MB) ...`);
-		await download(`${MODEL_BASE}/${name}`, dest);
+		await download(`${MODEL_BASE}/${name}`, modelPath(name));
 	}
 
 	const bin = path.join(ROOT, "bin", "pi-speak");

@@ -14,7 +14,7 @@ import { spawn, ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
-import { hasEspeak, ortLibPath, provision, ROOT } from "./provision";
+import { hasEspeak, installed, ortLibPath, provision, ROOT } from "./provision";
 
 // A machine with this file speaks through another machine's daemon, which an SSH tunnel serves on REMOTE_SOCKET
 // (the desktop creates both). It never runs a daemon of its own, so it never downloads one either.
@@ -116,6 +116,7 @@ let sessionContext: ExtensionContext | null = null;
 let retryAt = 0;
 let provisioning: Promise<string> | null = null;
 let provisioned: string | null = null;
+let espeakFound = false;
 let setupError: string | null = null;
 
 function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
@@ -125,13 +126,14 @@ function notify(message: string, level: "info" | "warning" | "error" = "info"): 
 /** The daemon binary once this machine has everything it needs, downloading the rest in the background. */
 function readyBinary(): string | null {
 	if (setupError) return null;
-	if (!hasEspeak()) {
+	if (!espeakFound && !(espeakFound = hasEspeak())) {
 		setupError = "needs espeak-ng: sudo pacman -S espeak-ng (Arch), sudo apt install espeak-ng, or brew install espeak-ng";
 		notify(setupError, "warning");
 		return null;
 	}
 	if (process.env.PI_SPEAK_BIN) return resolveBinaryPath();
-	if (!provisioning) {
+	provisioned ??= installed();
+	if (!provisioned && !provisioning) {
 		let announced = false;
 		provisioning = provision((step) => {
 			if (!announced) notify("first run: downloading the voice (about 350 MB), speech starts once it's done");
@@ -277,7 +279,8 @@ async function getSocket(): Promise<net.Socket> {
 		// 2. Spawn daemon if not running; a machine speaking through a desktop stays silent until the tunnel is back
 		const binaryPath = remote ? null : readyBinary();
 		if (!binaryPath) {
-			retryAt = Date.now() + 5000;
+			// Still downloading needs no backoff: checking again is cheap, and speech starts the moment it's done
+			if (remote || setupError) retryAt = Date.now() + 5000;
 			throw new Error(remote ? "desktop tunnel is down" : setupError ?? "pi-speak is still being set up");
 		}
 
